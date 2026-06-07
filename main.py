@@ -327,9 +327,11 @@ Whether you're an AI enthusiast, content creator, or simply curious about the po
 Experience the future of digital creativity today."""
 ]
 
+current_ad_index = 0
+
 
 # ============================================================
-# CONFIG (UNCHANGED)
+# CONFIG
 # ============================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -362,13 +364,12 @@ if DATABASE_URL.startswith("postgres://"):
 elif DATABASE_URL.startswith("postgresql://") and "+asyncpg" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ad-bot")
 
 
 # ============================================================
-# DATABASE (UNCHANGED)
+# DATABASE
 # ============================================================
 
 class Base(DeclarativeBase):
@@ -380,10 +381,22 @@ class GroupState(Base):
 
     chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     message_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    last_ad_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_ad_time: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
 
 
 engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
@@ -391,7 +404,7 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSe
 
 
 # ============================================================
-# TELEGRAM (UNCHANGED)
+# TELEGRAM
 # ============================================================
 
 bot = Bot(
@@ -404,90 +417,233 @@ router = Router()
 dp.include_router(router)
 
 send_lock = asyncio.Lock()
-current_ad_index = 0
+checker_task: asyncio.Task | None = None
 
 
-def utcnow():
+def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def is_service_message(message: Message) -> bool:
+    return any(
+        [
+            bool(message.group_chat_created),
+            bool(message.supergroup_chat_created),
+            bool(message.channel_chat_created),
+            bool(message.new_chat_members),
+            bool(message.left_chat_member),
+            message.migrate_to_chat_id is not None,
+            message.migrate_from_chat_id is not None,
+            message.pinned_message is not None,
+        ]
+    )
+
+
+async def init_db() -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    logger.info("Database tables are ready")
+
+
+async def get_or_create_group_state(session: AsyncSession, chat_id: int) -> GroupState:
+    state = await session.get(GroupState, chat_id)
+    if state is None:
+        state = GroupState(
+            chat_id=chat_id,
+            message_count=0,
+            last_ad_time=None,
+            created_at=utcnow(),
+            updated_at=utcnow(),
+        )
+        session.add(state)
+        await session.flush()
+        logger.info("Created new group_state row for chat_id=%s", chat_id)
+    return state
 
 
 def ad_is_due(state: GroupState) -> bool:
     if state.message_count < MIN_MESSAGES:
         return False
+
     if state.last_ad_time is None:
         return True
-    return utcnow() - state.last_ad_time >= timedelta(seconds=MIN_INTERVAL_SECONDS)
+
+    elapsed = utcnow() - state.last_ad_time
+    return elapsed >= timedelta(seconds=MIN_INTERVAL_SECONDS)
 
 
-def get_next_ad_text():
+def get_next_ad_text() -> str:
     global current_ad_index
-    ad = ADS[current_ad_index]
-    current_ad_index = (current_ad_index + 1) % len(ADS)
-    return ad
+
+    ad_text = ADS[current_ad_index]
+    current_ad_index += 1
+
+    if current_ad_index >= len(ADS):
+        current_ad_index = 0
+
+    return ad_text
 
 
-async def try_send_ad(chat_id: int):
+async def try_send_ad_for_chat(chat_id: int) -> bool:
     async with send_lock:
         async with SessionLocal() as session:
             state = await session.get(GroupState, chat_id)
-            if not state or not ad_is_due(state):
+
+            if state is None:
+                logger.warning("No DB row found for chat_id=%s", chat_id)
                 return False
 
+            if not ad_is_due(state):
+                return False
+
+            ad_text = get_next_ad_text()
+
             try:
-                await bot.send_message(chat_id, get_next_ad_text())
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=ad_text,
+                    disable_web_page_preview=False,
+                )
             except TelegramAPIError:
-                logger.exception("Telegram error")
+                logger.exception("Telegram API error while sending ad to chat_id=%s", chat_id)
+                return False
+            except Exception:
+                logger.exception("Unexpected error while sending ad to chat_id=%s", chat_id)
                 return False
 
             state.message_count = 0
             state.last_ad_time = utcnow()
             state.updated_at = utcnow()
             await session.commit()
+
+            logger.info("Ad sent successfully to chat_id=%s", chat_id)
             return True
 
 
+async def periodic_checker() -> None:
+    while True:
+        try:
+            async with SessionLocal() as session:
+                result = await session.execute(select(GroupState.chat_id))
+                chat_ids = [row[0] for row in result.all()]
+
+            for chat_id in chat_ids:
+                await try_send_ad_for_chat(chat_id)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Periodic checker failed")
+
+        await asyncio.sleep(CHECK_INTERVAL_SECONDS)
+
+
+# ============================================================
+# HANDLERS
+# ============================================================
+
 @router.message(Command("start"))
-async def start(message: Message):
+async def start_handler(message: Message) -> None:
     await message.answer("ربات فعال است.")
 
 
-@router.message(F.chat.type.in_({"group", "supergroup"}))
-async def handler(message: Message):
-    if not message.from_user or message.from_user.is_bot:
-        return
-
+@router.message(Command("status"))
+async def status_handler(message: Message) -> None:
     async with SessionLocal() as session:
         state = await session.get(GroupState, message.chat.id)
-        if not state:
-            state = GroupState(chat_id=message.chat.id, message_count=0)
-            session.add(state)
 
+    if state is None:
+        await message.answer("برای این گروه هنوز رکوردی در دیتابیس نیست.")
+        return
+
+    last_ad_text = "None" if state.last_ad_time is None else state.last_ad_time.isoformat()
+
+    await message.answer(
+        f"chat_id: <code>{state.chat_id}</code>\n"
+        f"message_count: <code>{state.message_count}</code>\n"
+        f"last_ad_time: <code>{last_ad_text}</code>\n"
+        f"current_ad_index: <code>{current_ad_index}</code>"
+    )
+
+
+@router.message(F.chat.type.in_({"group", "supergroup"}))
+async def group_message_handler(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    if message.from_user.is_bot:
+        return
+
+    if is_service_message(message):
+        return
+
+    logger.info(
+        "Message received: chat=%s user=%s type=%s",
+        message.chat.id,
+        message.from_user.id,
+        message.content_type,
+    )
+
+    async with SessionLocal() as session:
+        state = await get_or_create_group_state(session, message.chat.id)
         state.message_count += 1
         state.updated_at = utcnow()
         await session.commit()
 
-    await try_send_ad(message.chat.id)
+    await try_send_ad_for_chat(message.chat.id)
 
 
 # ============================================================
-# WEBHOOK (UNCHANGED)
+# STARTUP / SHUTDOWN
 # ============================================================
 
-async def on_startup(app: web.Application):
-    await bot.set_webhook(WEBHOOK_URL, secret_token=WEBHOOK_SECRET or None)
-    logger.info("Webhook set")
+async def on_startup(app: web.Application) -> None:
+    global checker_task
+
+    await init_db()
+
+    await bot.set_webhook(
+        url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET or None,
+        drop_pending_updates=True,
+    )
+    logger.info("Webhook set to: %s", WEBHOOK_URL)
+
+    checker_task = asyncio.create_task(periodic_checker())
+    app["checker_task"] = checker_task
 
 
-async def on_shutdown(app: web.Application):
-    await bot.delete_webhook()
+async def on_shutdown(app: web.Application) -> None:
+    task = app.get("checker_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+    except Exception:
+        logger.exception("Failed to delete webhook on shutdown")
+
     await bot.session.close()
     await engine.dispose()
 
 
-def main():
+# ============================================================
+# APP
+# ============================================================
+
+def main() -> None:
     app = web.Application()
 
-    SimpleRequestHandler(dp, bot, secret_token=WEBHOOK_SECRET or None).register(app, WEBHOOK_PATH)
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET or None,
+    ).register(app, path=WEBHOOK_PATH)
+
     setup_application(app, dp, bot=bot)
 
     app.on_startup.append(on_startup)
