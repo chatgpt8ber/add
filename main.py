@@ -326,7 +326,6 @@ Whether you're an AI enthusiast, content creator, or simply curious about the po
 
 Experience the future of digital creativity today."""
 ]
-
 current_ad_index = 0
 
 
